@@ -1,4 +1,5 @@
 import math
+import numpy as np
 
 from MESgauss import Gauss
 
@@ -46,6 +47,8 @@ class Element:
         self.H = []
         self.Hbc=[]
         self.surfaces=[Surface(), Surface(), Surface(), Surface()]
+        self.P=[]
+        self.C=[]
 
 class Surface:
     def __init__(self):
@@ -265,6 +268,7 @@ class Jakobian:
         self.dNpodx = []
         self.dNpody = []
         self.H = []
+        self.C = [[0.0 for _ in range(4)] for _ in range(4)]
 
     def obliczanieWartosci(self):
         dxdksi, dxdeta, dydksi, dydeta = [], [], [], []
@@ -314,24 +318,74 @@ class Jakobian:
                     H[a][b] += self.data.Conductivity * (termX + termY) * detJ_local * waga
         self.H = H
         self.element.H = H
+        for j in range(self.npc2d):
+            detJ_local = self.detJ[j]
+            w_ksi = self.el_univ.w[j % self.npc]
+            w_eta = self.el_univ.w[j // self.npc]
+            waga = w_ksi * w_eta
+
+            # wartości N w punkcie całkowania
+            ksi, eta = self.el_univ.pc2d[j]
+            N = [
+                0.25 * (1 - ksi) * (1 - eta),
+                0.25 * (1 + ksi) * (1 - eta),
+                0.25 * (1 + ksi) * (1 + eta),
+                0.25 * (1 - ksi) * (1 + eta)
+            ]
+
+            for a in range(4):
+                for b in range(4):
+                    self.C[a][b] += (
+                            self.data.Density *
+                            self.data.SpecificHeat *
+                            N[a] * N[b] *
+                            detJ_local * waga
+                    )
+
+        self.element.C = self.C
 
 
 class UkladRownan:
     def __init__(self, grid1):
         self.grid = grid1
         self.hGlobalna = []
+        self.pGlobalne=[]
+        self.cGlobalna=[]
 
-    def agregacja2d(self):
+    def agregacja2dH(self):
         H = [[0.0 for _ in range(self.grid.numNode)] for _ in range(self.grid.numNode)]
         for element in self.grid.elementsArray:
             hLokalna = element.H
+            hbcLokalna=element.Hbc
             id = [n - 1 for n in element.nodeArray]
             for j in range(4):
                 for k in range(4):
                     H[id[j]][id[k]] += hLokalna[j][k]
+                    H[id[j]][id[k]] += hbcLokalna[j][k]
         self.hGlobalna = H
+    def agregacja2dP(self):
+        P = [0.0 for _ in range(self.grid.numNode)]
+        for element in self.grid.elementsArray:
+            pLokalne = element.P
+            id = [n - 1 for n in element.nodeArray]
+            for j in range(4):
+                    P[id[j]] += pLokalne[j]
+        self.pGlobalne = P
 
-class HbcGenerator:
+    def agregacja2dC(self):
+        C = [[0.0 for _ in range(self.grid.numNode)]
+             for _ in range(self.grid.numNode)]
+
+        for element in self.grid.elementsArray:
+            cLokalna = element.C
+            id = [n - 1 for n in element.nodeArray]
+            for i in range(4):
+                for j in range(4):
+                    C[id[i]][id[j]] += cLokalna[i][j]
+
+        self.cGlobalna = C
+
+class HbcAndPGenerator:
     def __init__(self, element, grid, data, el_univ):
         self.element = element
         self.grid = grid
@@ -339,6 +393,8 @@ class HbcGenerator:
         self.el_univ = el_univ
         self.Hbc = [[0.0 for _ in range(4)] for _ in range(4)]
         self.w_1d = Gauss(1).w
+        self.P=[0.0 for _ in range(4)]
+        self.tOtoczenia=data.Tot
 
     def dlugosc_boku(self, n1, n2):
         x1 = self.grid.nodesArray[n1 - 1].x
@@ -347,7 +403,35 @@ class HbcGenerator:
         y2 = self.grid.nodesArray[n2 - 1].y
         return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
 
-    def compute(self):
+    def computeHbc(self):
+        nodes = self.element.nodeArray
+
+        boki = [
+            (nodes[0], nodes[1], 0),
+            (nodes[1], nodes[2], 1),
+            (nodes[2], nodes[3], 2),
+            (nodes[3], nodes[0], 3)
+        ]
+
+        for (n1, n2, s_id) in boki:
+            if not (self.grid.nodesArray[n1-1].BC and self.grid.nodesArray[n2-1].BC):
+                continue
+
+
+            L = self.dlugosc_boku(n1, n2)
+            detJ = L / 2.0
+
+            surface = self.el_univ.surfaces[s_id]
+
+            for p, N in enumerate(surface.N):
+                w = self.w_1d[p]
+                for i in range(4):
+                    for j in range(4):
+                        self.Hbc[i][j] += self.data.Alfa * N[i] * N[j] * w * detJ
+
+        self.element.Hbc = self.Hbc
+        return self.Hbc
+    def computeP(self):
         nodes = self.element.nodeArray
 
         boki = [
@@ -369,9 +453,25 @@ class HbcGenerator:
             for p, N in enumerate(surface.N):
                 w = self.w_1d[p]
                 for i in range(4):
-                    for j in range(4):
-                        self.Hbc[i][j] += self.data.Alfa * N[i] * N[j] * w * detJ
+                    self.P[i]+= self.data.Alfa * N[i]* w*self.tOtoczenia * detJ
 
-        self.element.Hbc = self.Hbc
-        return self.Hbc
+        self.element.P = self.P
+        return self.P
 
+class SystemOfEquation:
+    def __init__(self, ukladrownan):
+        self.HGl = np.array(ukladrownan.hGlobalna, dtype=float)
+        self.PGl = np.array(ukladrownan.pGlobalne, dtype=float)
+        self.t = None
+
+    def solve(self):
+        # Upewniamy się, że P jest wektorem 16-elementowym
+        P = self.PGl.flatten()  # np. z [1x16] → [16]
+
+        # Mamy równanie: H * t = -P
+        right_side = P
+
+        # Rozwiązanie układu równań liniowych
+        self.t = np.linalg.solve(self.HGl, right_side)
+
+        return self.t
